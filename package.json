@@ -1,0 +1,22 @@
+{
+  "name": "lms-plugin-local-shell-access",
+  "version": "0.1.0",
+  "description": "LM Studio plugin that lets the model run commands in the user's shell.",
+  "main": "index.js",
+  "scripts": {
+    "dev": "lms dev",
+    "push": "lms push",
+    "build": "tsc",
+    "test:verify": "tsc && node test/verify-shell.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@lmstudio/sdk": "1.4.0",
+    "zod": "3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.8",
+    "typescript": "5.6"
+  }
+}

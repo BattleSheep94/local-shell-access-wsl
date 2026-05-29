@@ -1,0 +1,7 @@
+{
+  "type": "plugin",
+  "runner": "node",
+  "owner": "battlesheep",
+  "name": "local-shell-access",
+  "revision": 2
+}
