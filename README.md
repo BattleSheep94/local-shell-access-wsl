@@ -49,6 +49,11 @@ npm run push  # lms push
 | --- | --- |
 | `shell_exec` | Run a command on the host or in WSL. Supports pipes, redirects, `&&`, globs, command substitution, optional `target` / `cwd` / `env` / `timeout_ms` overrides. Returns exit code, stdout, stderr. |
 | `shell_info` | Report the resolved shell binary, args template, default cwd, user, hostname, platform, home directory, and WSL settings for the selected target. For WSL, these values are probed inside the Linux distribution. |
+| `shell_session_start` | Start a persistent host or WSL shell for stateful work such as SSH, prompts, or Python virtual environments. |
+| `shell_session_write` | Send input or a command to a persistent shell session and read output. |
+| `shell_session_read` | Read output from a persistent shell session without sending input. |
+| `shell_session_stop` | Stop and remove a persistent shell session. |
+| `shell_session_list` | List currently open persistent shell sessions. |
 
 Each `shell_exec` call spawns a fresh shell process — there is no persistent
 session, so `cd` and exported vars do **not** carry over between calls. Chain
@@ -58,6 +63,23 @@ To choose WSL for one call, pass `target: "wsl"` to `shell_exec` or
 `shell_info`. Leave it out to use the configured default target. For WSL calls,
 `cwd` accepts Linux paths such as `/home/me/project` and Windows paths such as
 `P:\repo\project`; `wsl.exe --cd` handles the conversion.
+
+### WSL default working directory examples
+
+`wslDefaultCwd` is the directory where WSL commands start when a tool call does
+not provide `cwd`. You can use any path accepted by `wsl.exe --cd`:
+
+| Desired start directory | Recommended value |
+| --- | --- |
+| WSL user's home | Leave blank |
+| Root user's home | `/root` or `\\wsl.localhost\Ubuntu-24.04\root` |
+| Normal user's home | `/home/alice` or `\\wsl.localhost\Ubuntu-24.04\home\alice` |
+| Windows project folder | `P:\Programmierung\Visual Studio 18\Projects\lsa\local-shell-access` |
+| Same folder as WSL mount | `/mnt/p/Programmierung/Visual Studio 18/Projects/lsa/local-shell-access` |
+
+In `shell_info`, `defaultCwd` is the Linux path actually used by the shell.
+`wsl.windowsDefaultCwd` is the Windows/Explorer view of the same location, such
+as `\\wsl.localhost\Ubuntu-24.04\root`.
 
 If your WSL distribution defaults to `root`, set `wslUser` to an unprivileged
 Linux user before giving a model tool access. When `wslUser` is blank, WSL uses
@@ -73,10 +95,64 @@ aliases or shell functions from `~/.bashrc` / `~/.bash_aliases` (for example
 `bash -l -c`, which is suitable for scripts but does not expand interactive
 aliases.
 
+### SSH command placement
+
+Shell operators outside `ssh` still run locally. This command connects over SSH,
+then writes the file locally in WSL after SSH exits:
+
+```sh
+bsssh && echo "Das ist ein Test!" > LMSTUDIO.txt
+```
+
+To write on the remote server, pass the command to SSH:
+
+```sh
+bsssh 'echo "Das ist ein Test!" > ~/LMSTUDIO.txt'
+bsssh 'cat ~/LMSTUDIO.txt'
+```
+
+For server updates, prefer an explicit remote command:
+
+```sh
+bsssh 'apt update && apt upgrade'
+```
+
+If the command asks questions or needs state, use a persistent shell session
+instead of `shell_exec`.
+
+### Persistent sessions
+
+`shell_exec` is intentionally stateless: every call starts a fresh shell. Use
+the session tools when you need state:
+
+```text
+shell_session_start target=wsl interactive_shell=true
+shell_session_write session_id=... input="bsssh"
+shell_session_read session_id=...
+shell_session_write session_id=... input="apt update && apt upgrade"
+shell_session_read session_id=...
+shell_session_write session_id=... input="y"
+shell_session_stop session_id=...
+```
+
+This also works for Python virtual environments:
+
+```text
+shell_session_start target=wsl cwd="/path/to/project"
+shell_session_write session_id=... input="source .venv/bin/activate"
+shell_session_write session_id=... input="python --version"
+shell_session_stop session_id=...
+```
+
+The session tools keep stdin/stdout/stderr connected, but they are not a full
+terminal emulator. Some programs that require a real TTY may still need flags
+such as `ssh -tt` or a non-interactive command form.
+
 ## Configuration
 
 | Field | Default | Notes |
 | --- | --- | --- |
+| `promptGuidance` | `true` | Inject shell usage and safety guidance into prompts. |
 | `defaultTarget` | `host` | Where commands run when a tool call does not specify `target`. Use `host` or `wsl`. |
 | `shell` | (auto-detect) | Absolute path to a shell binary. Blank = auto. |
 | `loginShell` | `true` | Pass `-l` so the login profile is sourced. Disable for faster startup if your environment doesn't depend on profile-sourced PATH. |

@@ -2,6 +2,15 @@ import { createConfigSchematics } from "@lmstudio/sdk";
 
 export const configSchematics = createConfigSchematics()
   .field(
+    "promptGuidance",
+    "boolean",
+    {
+      displayName: "Inject shell safety prompt",
+      hint: "Inject guidance that tells the model how to use shell_exec, persistent sessions, WSL, SSH, and confirmations safely.",
+    },
+    true,
+  )
+  .field(
     "defaultTarget",
     "string",
     {

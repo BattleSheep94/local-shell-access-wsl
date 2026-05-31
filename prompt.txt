@@ -1,0 +1,6 @@
+Passe das Beispiel für "WSL default working directory" an.
+Mir ist unklar wie der Pfad aussehen soll.
+
+Zum Screenshot. Der Befehl wurde über WSL Ausgeführt und hat Funktioniert, die Datei wurde aber auf der WSL Distro erstellt und nicht auf dem Server über SSH.
+Kann das Plugin mit "laufenden" Befehlen interagieren? Ein Beispiel, das Modell soll den Server über SSH Updaten. Wir verbinden also über WSL mit SSH und führen "apt update && apt upgrade" aus, der Command stellt aber eine Rückfrage ob das Paket installiert werden soll und es muss mit y/n geantwortet werden. Wir wollen nach und nach die gleichen funktionen wie Warp haben.
+Außerdem sollen irreversible commands extra bestätigt werden, schreibe für das Plugin auch ein Systemprompt.

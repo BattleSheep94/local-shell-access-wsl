@@ -14,7 +14,16 @@ process.env.PATH = process.platform === "win32" ? "" : "/usr/bin:/bin";
 
 const path = require("path");
 const os = require("os");
-const { runShell, describeEnvironment, formatRunResult } = require(
+const {
+  runShell,
+  describeEnvironment,
+  formatRunResult,
+  startShellSession,
+  writeShellSession,
+  readShellSession,
+  stopShellSession,
+  listShellSessions,
+} = require(
   path.join(__dirname, "..", "dist", "shell"),
 );
 
@@ -243,6 +252,32 @@ async function runWslTests() {
   console.log(formatRunResult(aliasShell, SETTINGS.maxOutputBytes));
   if (!assert(aliasShell.exitCode === 0, "wsl interactive alias probe exit 0")) failed = true;
   if (!assert(aliasShell.stdout.includes("on"), "wsl interactive shell expands aliases")) failed = true;
+
+  bar("wsl persistent session");
+  const session = await startShellSession(
+    { ...SETTINGS, wslInteractiveShell: true },
+    { target: "wsl", readDelayMs: 200 },
+  );
+  console.log(session);
+  if (!assert(session.alive === true, "session starts alive")) failed = true;
+  if (!assert(listShellSessions().some((s) => s.id === session.id), "session is listed")) failed = true;
+
+  await writeShellSession(session.id, "cd /tmp", { readDelayMs: 100 });
+  await writeShellSession(session.id, "export LSA_SESSION_TEST=ok", { readDelayMs: 100 });
+  const sessionOut = await writeShellSession(
+    session.id,
+    'printf "%s:%s\\n" "$PWD" "$LSA_SESSION_TEST"',
+    { readDelayMs: 300 },
+  );
+  console.log(sessionOut);
+  if (!assert(sessionOut.stdout.includes("/tmp:ok"), "session preserves cwd and env state")) failed = true;
+
+  const emptyRead = await readShellSession(session.id, { readDelayMs: 50 });
+  if (!assert(emptyRead.id === session.id, "session can be read")) failed = true;
+
+  const stopped = await stopShellSession(session.id, { readDelayMs: 100 });
+  console.log(stopped);
+  if (!assert(!listShellSessions().some((s) => s.id === session.id), "session is removed after stop")) failed = true;
 
   bar("wsl user override");
   const rootOut = await runShell({ ...SETTINGS, wslUser: "root" }, "whoami", { target: "wsl" });

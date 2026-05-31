@@ -1,4 +1,5 @@
-import { spawn } from "child_process";
+import { type ChildProcessWithoutNullStreams, spawn } from "child_process";
+import { randomBytes } from "crypto";
 import { existsSync } from "fs";
 import { homedir, hostname, platform, userInfo } from "os";
 
@@ -27,6 +28,15 @@ export interface RunOptions {
   target?: ShellTarget;
 }
 
+export interface SessionOptions {
+  signal?: AbortSignal;
+  cwd?: string;
+  env?: Record<string, string>;
+  target?: ShellTarget;
+  interactiveShell?: boolean;
+  readDelayMs?: number;
+}
+
 export interface RunResult {
   target: ShellTarget;
   stdout: string;
@@ -40,7 +50,36 @@ export interface RunResult {
   cwd: string;
 }
 
+export interface ShellSessionInfo {
+  id: string;
+  target: ShellTarget;
+  shell: string;
+  shellArgs: string[];
+  cwd: string;
+  alive: boolean;
+  exitCode: number | null;
+  termSignal: NodeJS.Signals | null;
+  startedAt: string;
+  lastActivityAt: string;
+}
+
+export interface ShellSessionResult extends ShellSessionInfo {
+  stdout: string;
+  stderr: string;
+  truncated: { stdout: boolean; stderr: boolean };
+}
+
+interface ShellSessionState extends ShellSessionInfo {
+  child: ChildProcessWithoutNullStreams;
+  stdoutBuffer: string;
+  stderrBuffer: string;
+  stdoutBytes: number;
+  stderrBytes: number;
+  maxOutputBytes: number;
+}
+
 let cachedAutoShell: string | null = null;
+const sessions = new Map<string, ShellSessionState>();
 
 // LM Studio's plugin runtime does not inherit the user's interactive shell
 // environment (PATH, SHELL, etc. are stripped down). To run "the user's shell"
@@ -156,6 +195,45 @@ function buildWslArgs(
   return { executable, args, shell: wslShell, shellArgs };
 }
 
+function buildWslSessionArgs(
+  settings: ShellSettings,
+  cwd: string,
+  interactiveShell: boolean,
+  env?: Record<string, string>,
+): { executable: string; args: string[]; shell: string; shellArgs: string[] } {
+  const executable = resolveWslExecutable();
+  const wslShell = settings.wslShell.trim() || "/bin/bash";
+  const shellArgs = buildShellSessionArgs(
+    wslShell,
+    settings.wslLoginShell,
+    interactiveShell,
+  );
+  const args: string[] = [];
+  const distro = settings.wslDistro.trim();
+
+  if (distro.length > 0) {
+    args.push("--distribution", distro);
+  }
+
+  const user = settings.wslUser.trim();
+  if (user.length > 0) {
+    args.push("--user", user);
+  }
+
+  args.push("--cd", cwd, "--exec");
+
+  const envEntries = Object.entries(env ?? {});
+  if (envEntries.length > 0) {
+    args.push("/usr/bin/env");
+    for (const [key, value] of envEntries) {
+      args.push(`${key}=${value}`);
+    }
+  }
+
+  args.push(wslShell, ...shellArgs);
+  return { executable, args, shell: wslShell, shellArgs };
+}
+
 function buildShellArgs(
   shellPath: string,
   loginShell: boolean,
@@ -177,6 +255,105 @@ function buildShellArgs(
   if (interactiveShell) args.push("-i");
   args.push("-c", command);
   return args;
+}
+
+function buildShellSessionArgs(
+  shellPath: string,
+  loginShell: boolean,
+  interactiveShell: boolean,
+): string[] {
+  const lower = shellPath.toLowerCase();
+  if (lower.endsWith("cmd.exe") || lower.endsWith("\\cmd")) {
+    return ["/d"];
+  }
+  if (lower.endsWith("powershell.exe") || lower.endsWith("pwsh.exe") || lower.endsWith("pwsh")) {
+    return ["-NoLogo", "-NoProfile"];
+  }
+  const args: string[] = [];
+  if (loginShell) args.push("-l");
+  if (interactiveShell) args.push("-i");
+  return args;
+}
+
+function appendSessionOutput(
+  session: ShellSessionState,
+  stream: "stdout" | "stderr",
+  chunk: Buffer,
+) {
+  const currentText = stream === "stdout" ? session.stdoutBuffer : session.stderrBuffer;
+  const currentBytes = stream === "stdout" ? session.stdoutBytes : session.stderrBytes;
+  const nextBytes = currentBytes + chunk.length;
+  let nextText = currentText + chunk.toString("utf-8");
+
+  if (Buffer.byteLength(nextText, "utf-8") > session.maxOutputBytes) {
+    const marker = "\n[session output truncated before this point]\n";
+    const markerBytes = Buffer.byteLength(marker, "utf-8");
+    const keepBytes = Math.max(0, session.maxOutputBytes - markerBytes);
+    const bytes = Buffer.from(nextText, "utf-8");
+    nextText = marker + bytes.subarray(Math.max(0, bytes.length - keepBytes)).toString("utf-8");
+  }
+
+  if (stream === "stdout") {
+    session.stdoutBuffer = nextText;
+    session.stdoutBytes = nextBytes;
+  } else {
+    session.stderrBuffer = nextText;
+    session.stderrBytes = nextBytes;
+  }
+}
+
+function drainSessionOutput(session: ShellSessionState): {
+  stdout: string;
+  stderr: string;
+  truncated: { stdout: boolean; stderr: boolean };
+} {
+  const stdout = session.stdoutBuffer;
+  const stderr = session.stderrBuffer;
+  const truncated = {
+    stdout: stdout.includes("[session output truncated before this point]"),
+    stderr: stderr.includes("[session output truncated before this point]"),
+  };
+  session.stdoutBuffer = "";
+  session.stderrBuffer = "";
+  session.stdoutBytes = 0;
+  session.stderrBytes = 0;
+  return { stdout, stderr, truncated };
+}
+
+function sessionSnapshot(session: ShellSessionState): ShellSessionInfo {
+  return {
+    id: session.id,
+    target: session.target,
+    shell: session.shell,
+    shellArgs: session.shellArgs,
+    cwd: session.cwd,
+    alive: session.alive,
+    exitCode: session.exitCode,
+    termSignal: session.termSignal,
+    startedAt: session.startedAt,
+    lastActivityAt: session.lastActivityAt,
+  };
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("Aborted"));
+    };
+    if (signal !== undefined) {
+      if (signal.aborted) {
+        onAbort();
+      } else {
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+    }
+  });
+}
+
+function createSessionId(): string {
+  return randomBytes(8).toString("hex");
 }
 
 export async function runShell(
@@ -296,6 +473,123 @@ export async function runShell(
       });
     });
   });
+}
+
+export async function startShellSession(
+  settings: ShellSettings,
+  opts: SessionOptions = {},
+): Promise<ShellSessionResult> {
+  const target = opts.target ?? resolveShellTarget(settings.defaultTarget);
+  const isWsl = target === "wsl";
+  const hostCwd = isWsl ? homedir() : resolveCwd(settings, opts.cwd);
+  const cwd = isWsl ? resolveWslCwd(settings, opts.cwd) : hostCwd;
+  const interactiveShell = opts.interactiveShell ?? (isWsl ? settings.wslInteractiveShell : false);
+  const shellPath = isWsl ? resolveWslExecutable() : resolveShell(settings.shell);
+  const wslCommand = isWsl
+    ? buildWslSessionArgs(settings, cwd, interactiveShell, opts.env)
+    : null;
+  const shellArgs = isWsl
+    ? wslCommand!.args
+    : buildShellSessionArgs(shellPath, settings.loginShell, interactiveShell);
+
+  const child = spawn(shellPath, shellArgs, {
+    cwd: hostCwd,
+    env: isWsl ? process.env : { ...process.env, ...(opts.env ?? {}) },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  const now = new Date().toISOString();
+  const session: ShellSessionState = {
+    id: createSessionId(),
+    target,
+    shell: isWsl ? wslCommand!.shell : shellPath,
+    shellArgs: isWsl ? wslCommand!.shellArgs : shellArgs,
+    cwd,
+    alive: true,
+    exitCode: null,
+    termSignal: null,
+    startedAt: now,
+    lastActivityAt: now,
+    child,
+    stdoutBuffer: "",
+    stderrBuffer: "",
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    maxOutputBytes: settings.maxOutputBytes,
+  };
+
+  child.stdout.on("data", (chunk: Buffer) => appendSessionOutput(session, "stdout", chunk));
+  child.stderr.on("data", (chunk: Buffer) => appendSessionOutput(session, "stderr", chunk));
+  child.on("close", (code, signalName) => {
+    session.alive = false;
+    session.exitCode = code;
+    session.termSignal = signalName;
+    session.lastActivityAt = new Date().toISOString();
+  });
+
+  sessions.set(session.id, session);
+  await delay(opts.readDelayMs ?? 250, opts.signal);
+
+  const output = drainSessionOutput(session);
+  return { ...sessionSnapshot(session), ...output };
+}
+
+export async function writeShellSession(
+  sessionId: string,
+  input: string,
+  opts: { appendNewline?: boolean; readDelayMs?: number; signal?: AbortSignal } = {},
+): Promise<ShellSessionResult> {
+  const session = sessions.get(sessionId);
+  if (session === undefined) {
+    throw new Error(`Shell session not found: ${sessionId}`);
+  }
+  if (!session.alive || session.child.stdin.destroyed) {
+    const output = drainSessionOutput(session);
+    return { ...sessionSnapshot(session), ...output };
+  }
+
+  session.child.stdin.write(input + (opts.appendNewline === false ? "" : "\n"));
+  session.lastActivityAt = new Date().toISOString();
+  await delay(opts.readDelayMs ?? 500, opts.signal);
+
+  const output = drainSessionOutput(session);
+  return { ...sessionSnapshot(session), ...output };
+}
+
+export async function readShellSession(
+  sessionId: string,
+  opts: { readDelayMs?: number; signal?: AbortSignal } = {},
+): Promise<ShellSessionResult> {
+  const session = sessions.get(sessionId);
+  if (session === undefined) {
+    throw new Error(`Shell session not found: ${sessionId}`);
+  }
+
+  await delay(opts.readDelayMs ?? 250, opts.signal);
+  const output = drainSessionOutput(session);
+  return { ...sessionSnapshot(session), ...output };
+}
+
+export async function stopShellSession(
+  sessionId: string,
+  opts: { signal?: NodeJS.Signals; readDelayMs?: number; abortSignal?: AbortSignal } = {},
+): Promise<ShellSessionResult> {
+  const session = sessions.get(sessionId);
+  if (session === undefined) {
+    throw new Error(`Shell session not found: ${sessionId}`);
+  }
+
+  if (session.alive) {
+    session.child.kill(opts.signal ?? "SIGTERM");
+  }
+  await delay(opts.readDelayMs ?? 250, opts.abortSignal);
+  const output = drainSessionOutput(session);
+  sessions.delete(sessionId);
+  return { ...sessionSnapshot(session), ...output };
+}
+
+export function listShellSessions(): ShellSessionInfo[] {
+  return Array.from(sessions.values()).map(sessionSnapshot);
 }
 
 export function formatRunResult(result: RunResult, maxBytes: number): string {
